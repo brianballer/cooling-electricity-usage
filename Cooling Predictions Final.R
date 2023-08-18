@@ -1,0 +1,829 @@
+## ----setup, include=FALSE-----------------------------------------------------------------
+knitr::opts_chunk$set(echo = FALSE, include=FALSE)
+
+options(scipen=999)
+
+library(corrplot)
+library(glmnet)
+library(gam)
+library(e1071)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(gbm)
+library(earth)
+options(java.parameters = "-Xmx12g")
+library(rJava)
+library(bartMachine)
+library(caret)
+
+## -----------------------------------------------------------------------------------------
+knitr::purl("Cooling Predictions Final.Rmd")
+
+
+## ----Import and Cleaning------------------------------------------------------------------
+## import data
+df <- read.csv("data/2012_public_use_data_aug2016.csv")          
+
+
+## ----df Structure-------------------------------------------------------------------------
+## structure of df
+#str(df, list.len=ncol(df))
+
+
+## ----Filter for Pacific-------------------------------------------------------------------
+df <- subset(df, df$CENDIV == 9)
+
+
+## ----Combine colnames and descriptions----------------------------------------------------
+## import column description to help see what is what
+cb <- read.csv('data/codebook.csv', stringsAsFactors = FALSE)
+
+
+## ----Find Which Vars are Factors and Numerics---------------------------------------------
+## Id'ing factors and numerics to aid in EDA
+col_class <- as.data.frame(lapply(df, class))
+fact_vars <- names(df)[ sapply(df, is.factor) ] # Find column names of type 'Factor'
+num_vars <- names(df)[ sapply(df, is.integer)]  ## or num_vars <- which(sapply(df, is.integer))
+print(paste("There are", length(fact_vars), "factor variables and", length(num_vars), "numeric (integer) variables"))
+#str(df)
+
+## check for complete cases          ## No complete cases!!
+which(complete.cases(df) == T)   
+
+
+## ----Electricity Related Columns----------------------------------------------------------
+el_vars <- which(grepl("EL", colnames(df)) == TRUE)
+colnames(df[,el_vars])
+
+## Buildings with ELUSED == 2 and/or ELCOOL == 2 can be filtered out (they don't use electricity for cooling)
+table(df$ELCOOL)
+no_ELCOOL <- subset(df, df$ELCOOL == 2)
+## Check to ensure I didn't remove any rows with electricity usage for cooling (ELCLBTU != 0)
+sum(no_ELCOOL$ELCLBTU != 0)   ## all rows = 0
+
+
+
+## ----Delete rows with no electrical usage for cooling-------------------------------------
+if (sum(df$ELCLBTU == 0, na.rm=TRUE) != 0) {
+  df <- subset(df, df$ELCOOL != 2)
+  } else {
+    stop("rows already deleted")
+  }
+## Any zero usage rows still in df??
+sum(df$ELCLBTU == 0, na.rm=TRUE)
+
+
+## ----Response EDA-------------------------------------------------------------------------
+## summary data -- looks like there is a at least one zero and the median and mean aren't close to one another
+Y <- df$ELCLBTU
+summary(Y)
+
+## Number of NAs = 0
+sum(is.na(Y))
+
+## Number of 0's = 0
+sum(Y == 0, na.rm=TRUE)
+
+## boxplot shows big outlier
+boxplot(Y)
+
+## how far out is the outlier??   
+norm_Y <- (Y - mean(Y, na.rm=TRUE))/sd(Y, na.rm=TRUE)
+head(sort(norm_Y, decreasing=T))
+
+## which row is the outlier?
+which(norm_Y > 20)
+df[which(norm_Y > 20),]
+
+## check to see if Total Electricity, SQFT are also outliers
+norm_ELBTU <- (df$ELBTU - mean(df$ELBTU, na.rm=T))/sd(df$ELBTU, na.rm=T)
+head(sort(norm_ELBTU, decreasing=T))
+norm_ELBTU[799]
+norm_SQFT <- (df$SQFT - mean(df$SQFT, na.rm=T))/sd(df$SQFT, na.rm=T)
+head(sort(norm_SQFT, decreasing=T))
+norm_SQFT[799]
+
+## top 5 ELCLBTU values
+top_5 <- head(sort(df$ELCLBTU, decreasing = T))
+
+## error if outlier in test and training set data predicts pt to have same Y as second highest ELCLBTU
+abs(top_5[2] - top_5[1])
+abs(top_5[2] - top_5[1])/mean(df$ELCLBTU)
+## error if second highest is predicted to have third highest Y
+abs(top_5[2] - top_5[3])
+abs(top_5[2] - top_5[3])/mean(df$ELCLBTU)
+
+
+## ----Deleting Outlier in Y----------------------------------------------------------------
+
+## Deleting the outlier (should investigate first)
+df <- df[-799,]
+
+
+## ----Response EDA with Outlier Removed----------------------------------------------------
+
+## histogram -- bulk of density in the low usage realm
+par(mfrow=c(1,2))
+hist(Y)
+hist(Y, xlim=c(0,5000000), breaks=150)
+qqnorm(Y)
+qqline(Y)
+
+## log xform gets the histogram close to Normal
+hist(log(Y))
+qqnorm(log(Y))
+qqline(log(Y))
+
+
+## ----Z columms----------------------------------------------------------------------------
+## the Z columns contain info about imputing values or missing values
+z_cols <- which(grepl("Z", colnames(df)) == TRUE)
+#colnames(df[,z_cols])
+## search picked out col STRLZR (#1) as well
+z_cols <- z_cols[-1]
+
+## which Z columns show missing and unfilled data in the parent (code='9')
+miss_Z <- apply(df[,z_cols], 2, function(x){sum((x == 9))}) 
+head(sort(miss_Z, decreasing=T))   ### many Z columns have many 9s, meaning lots of missing data
+
+
+
+## ----Deleting the Z Columns---------------------------------------------------------------
+## the Z columns are useful for explaining the true predictors, and would be useful if we wanted to find imputed values and exclude them
+## I'll use the imputed data per the guidance in the accompanying documentation (p16 "EIA recommends using the imputed data...")
+## Deleting the Z Columns
+if (ncol(df) > 1100) {
+  df <- df[,-z_cols]
+  } else {
+    stop("You've already deleted these columns!")
+  }
+
+
+## ----Finding columns with many NAs--------------------------------------------------------
+## First finding which columns involve cooling
+cool_vars <- which(grepl("COOL", colnames(df)) == TRUE)
+colnames(df[,cool_vars])
+
+## Functions for counting NAs 
+na_count <- apply(df, 2, function(x){sum(is.na(x))})     ## count NAs in each column
+## Percentage of NAs in each column
+na_pert <- na_count/nrow(df)
+## How many NAs do our cooling columns have?  Important ones are ELCOOL, COOLP, RFCOOL -- they look good
+na_pert[cool_vars]
+## Make a dataframe of percentage NA and Column labels to see if we can delete the columns with NAs or keep them and impute
+na_pert_df <- as.data.frame(cbind(na_pert, cb$label[match(names(na_pert), cb$var)]), stringsAsFactors = F)
+colnames(na_pert_df) <- c("naperc", "label")
+na_pert_df$naperc <- as.numeric(na_pert_df$naperc)
+
+## sorted df of percent NA
+sorted <- na_pert_df[order(na_pert_df$naperc),]
+
+## which columns are close to full?
+subset(na_pert_df, na_pert_df$naperc <.1 & na_pert_df$naperc >0)
+
+## sort of columns that are over 95% NA
+#sort(na_pert[na_pert < .3])
+
+## Print Z column missing data and parent column side-by-side; there are some discrapancies due to missing Z columns for some parents
+# for (i in length(miss_Z)) {
+#   print(paste(names(sort(na_pert, decreasing = TRUE)), names(sort(miss_Z, decreasing=T))))
+# }
+
+
+## ----Deleting Columns with NAs------------------------------------------------------------
+full_cols <- which(na_pert == 0)
+names(full_cols)
+if (ncol(df) > 700) {
+  df <- df[, full_cols]
+  } else {
+    stop("You've already deleted these columns!")
+  }
+
+
+## ----Removing the Final Wt Columns--------------------------------------------------------
+## the FINALWT columns allow for scaling up the sample estimate of usage for all buildings the sample represents
+## there is no predictive value in them -- will remove and store in there own data frame
+wt_cols <- which(grepl("FINALWT", colnames(df)) == TRUE)
+colnames(df[,wt_cols])
+
+wt.df <- df[,wt_cols]
+wt.df <- cbind(df[,"PUBID"], wt.df)
+
+if (sum(grepl("FINALWT", colnames(df)) == TRUE) > 0) {
+  df <- df[,-wt_cols]
+  } else {
+    stop("You've already deleted these columns!")
+  }
+
+
+## ----Sparse or Low Variance Predictors----------------------------------------------------
+## Find and remove sparse and/or no-variance predictors;  nearZeroVar() is in caret libary
+## Many of the same columns show up here as in NA
+nzv <- nearZeroVar(df, saveMetrics = TRUE, freqCut = 99.99/.01)    ## Variables that are almost all one level (not including the Z columns)
+rownames(nzv)[nzv$nzv == TRUE]
+nzv <- nearZeroVar(df, saveMetrics = TRUE, freqCut = 95/5)    ## Variables that are almost all one level (not including the Z columns)
+rownames(nzv)[nzv$nzv == TRUE]
+
+
+
+## ----Deleting Low-Var Columns-------------------------------------------------------------
+## Deleting the low variance columns, but keeping a few that are likely significant
+lowvar_cols <- rownames(nzv)[nzv$nzv == TRUE]
+lowvar_cols <- lowvar_cols[!lowvar_cols %in% c("MONUSE", "CWUSED", "SOUSED", "CHWT", "OTCLEQ")]
+lowvar_cols
+
+if (sum(grepl("REGION", colnames(df)) == TRUE) > 0) {
+  df <- subset(df, select= -c(REGION, CENDIV, COOL, ELUSED, STUSED, HWUSED, WOUSED, COUSED, OTUSED, ELCOOL, MFUSED, DHUSED))
+  } else {
+    stop("You've already deleted these columns!")
+  }
+
+
+
+## ----Deleting the Usage Columns-----------------------------------------------------------
+## deleting the usage columns (except the response)
+use_cols <- which(grepl("BTU|EXP|CNS", colnames(df)) == TRUE)
+colnames(df[,use_cols])
+resp <- which(colnames(df[,use_cols]) == "ELCLBTU")
+if (sum(grepl("MFBTU", colnames(df)) == TRUE) > 0) {
+  use_cols <- use_cols[-resp]
+  df <- df[,-use_cols]
+  } else {
+    stop("You've already deleted these columns!")
+  }
+
+
+
+## ----Correlations, include=TRUE-----------------------------------------------------------
+## correlation between variables -- they are all still numerics, but MOST are really FACTORS
+M <- cor(df) #, use="pairwise.complete.obs")
+corrplot(M)
+#write.csv(round(as.data.frame(M), 2), file = "data/Corr.csv")
+
+## sorts all correlations with ELCLBTU
+M_sorted <- as.matrix(sort(M[,'ELCLBTU'], decreasing = TRUE))     
+## filter out low correlations and returns names of rows with high correlations
+M_high <- names(M_sorted[M_sorted > 0.2,])  ## or names(which(apply(M_sorted, 1, function(x) abs(x)>0.5)))   
+M <- M[M_high, M_high]                                    ## reestablished M matrix with filters and sort
+
+## both regular and mixed corrplots
+corrplot(M)
+corrplot.mixed(M, tl.col="black", tl.pos="lt")
+
+
+
+## ----Remove Highly Correlated Predictors--------------------------------------------------
+## Remove highly correlated predictors
+M2 <- cor(df)
+out <- as.data.frame(which(abs(M2) > 0.8, arr.ind=TRUE))
+out <- subset(out, out$row != out$col)
+#out$SPcorr <- apply(out, 1, function(x){cor(x,df$ELCLBTU)[1]})
+out
+
+if (sum(grepl("NWKERC", colnames(df)) == TRUE) > 0) {
+  df <- subset(df, select = -c(NWKERC, OPEN24, WKHRSC, MANU, CAPGEN, CHWT))
+  } else {
+    stop("You've already deleted these columns!")
+  }
+
+
+
+## ----Remove Duplicated Predictors---------------------------------------------------------
+## Several predictors have "duplicate" columns with "categories"; I chose the best one and deleted the other
+
+if (sum(grepl("YRCON", colnames(df)) == TRUE) > 0) {
+  #df <- subset(df, select = -c(PCTRMC, LAPTPC, SERVERN, LOHRPC, LNHRPC, SQFTC, NOCC, YRCON))
+  df <- subset(df, select = -c(SQFTC, NOCC, YRCON))
+  } else {
+    stop("You've already deleted these columns!")
+  }
+
+
+
+## ----Deleting ID Column-------------------------------------------------------------------
+## Deleting the Id column
+Id <- df$PUBID
+df <- subset(df, select=-PUBID)
+
+
+## ----Recoding Factors and Numerics--------------------------------------------------------
+## there are only 8 true integer columns left plus 3 ordered factors
+int_names <- c("SQFT", "WKHRS", "NWKER", "MONUSE", "COOLP", "HDD65", "CDD65", "ELCLBTU", "RFTILT", "NOCCAT", "YRCONC")
+ints <- match(int_names, names(df))
+
+
+## -----------------------------------------------------------------------------------------
+## factors to character
+df[,-ints] <- lapply(df[,-ints], as.character)
+
+## several factor columns can be coverted to integers by changing "995" to a better number
+##NFLOOR
+df$NFLOOR[df$NFLOOR %in% "994"] <- "20"    ## level "15 to 25" becomes 20
+df$NFLOOR[df$NFLOOR %in% "995"] <- "30"    ## level "25+" becomes 20
+##FLCEILHT
+df$FLCEILHT[df$FLCEILHT %in% "995"] <- "60"    ## level "50+" becomes 60
+
+## add new integer columns to vector and convert to integers
+ints <- c(ints, match(c("NFLOOR", "FLCEILHT"), names(df)))
+df[,match(c("NFLOOR", "FLCEILHT"), names(df))] <- lapply(df[,match(c("NFLOOR", "FLCEILHT"), names(df))], as.integer)
+
+## characters to factors
+df[,-ints] <- lapply(df[,-ints], factor)
+
+
+## ----Find Which Vars are Factors and Numerics II------------------------------------------
+## Id'ing factors and numerics to aid in EDA
+col_class <- as.data.frame(lapply(df, class))
+fact_vars <- names(df)[ sapply(df, is.factor) ] # Find column names of type 'Factor'
+num_vars <- names(df)[ sapply(df, is.integer)]  ## or num_vars <- which(sapply(df, is.integer))
+print(paste("There are", length(fact_vars), "factor variables and", length(num_vars), "numeric (integer) variables"))
+#str(df)
+
+## check for complete cases          ## No missing cases
+which(complete.cases(df) == F)   
+
+
+## ----Barplots and Scatterplots of Data----------------------------------------------------
+#summary(df)
+
+## explore data
+par(mfrow=c(2,3))
+for (i in 1:ncol(df)) {
+  barplot(table(df[,i]), main=colnames(df)[i])
+  #hist(df[,i], main=colnames(df)[i])
+}
+for (i in 1:ncol(df)) {
+  plot(ELCLBTU ~ df[,i], df, main=colnames(df)[i], xlab="")
+}
+
+
+## ----Initial RF Model to Explore Data-----------------------------------------------------
+lm.mod <- lm(log(ELCLBTU) ~., data=df)
+## Exploratory RF Model for Variable Importance
+explore.mod <- randomForest(log(ELCLBTU) ~., data=df)
+var.imp <- varImpPlot(explore.mod)
+summary(lm.mod)
+
+
+## -----------------------------------------------------------------------------------------
+covars <- colnames(df)
+labels_M <- cbind(covars, cb$label[match(covars, cb$var)])
+colnames(labels_M) <- c("covariate", "label")
+
+
+## ----Datasave, echo=F---------------------------------------------------------------------
+#save.image('data/T4_EDA.RData')
+#saveRDS(df, file='data/df_no_outlier.rds')
+#save.image(file='data/EDA_2.RData')
+
+
+## ----One-Hot Encoding Df------------------------------------------------------------------
+## update fact_vars and num_vars
+col_class <- as.data.frame(lapply(df, class))
+fact_vars <- names(df)[ sapply(df, is.factor) ] # Find column names of type 'Factor'
+num_vars <- names(df)[ sapply(df, is.integer)]  ## or num_vars <- which(sapply(df, is.integer))
+print(paste("There are", length(fact_vars), "factor variables and", length(num_vars), "numeric (integer) variables"))
+
+## One-Hot Encoding the Factors
+df.onehot <- dummyVars("~.", data=df[,fact_vars])      ## dummyVars function from caret library
+df.onehot <- data.frame(predict(df.onehot, newdata = df[,fact_vars]))
+
+## Full dataframe of numerics and factors
+dfoh <- cbind(df[,num_vars], df.onehot)
+which(colSums(dfoh)<1)
+
+
+
+## ----Training and Test Sets---------------------------------------------------------------
+## setting up training and test sets
+
+set.seed(41)
+trainrows <- sample(nrow(df), 0.7*nrow(df))
+
+## non-onehot encoded sets
+tr.df <- df[trainrows,]
+te.df <- df[-trainrows,]
+
+## one-hot encoded sets
+tr.dfoh <- dfoh[trainrows,]
+te.dfoh <- dfoh[-trainrows,]
+
+
+## ----RMSE Function------------------------------------------------------------------------
+## function used to for all models except boost
+
+## log version -- calculates rmse when using log(ELCLBTU)
+rmse <- function(mod, newdata, response) {
+  rmse <- sqrt(mean((exp(predict(mod, newdata)) - response)^2))
+  return(rmse)
+}
+
+## non-log version -- calculates rmse when using ELCLBTU
+rmse.std <- function(mod, newdata, response) {
+  rmse <- sqrt(mean((predict(mod, newdata) - response)^2))
+  return(rmse)
+}
+
+## RMSE function for gbm (it requires to specify ## of trees in predict function) non-log version
+rmse.boost <- function(mod, newdata, response, ntree) {
+  rmse <- sqrt(mean((exp(predict(mod, newdata, n.trees=ntree)) - response)^2))
+  return(rmse)
+}
+
+
+## ----Linear Model-------------------------------------------------------------------------
+lm.mod <- lm(log(ELCLBTU) ~., data=tr.dfoh)   ## linear uses one-hot encoded df
+summary(lm.mod)
+
+err.lm <- c(rmse(lm.mod, tr.dfoh, tr.dfoh$ELCLBTU), rmse(lm.mod, te.dfoh, te.dfoh$ELCLBTU))
+err.lm
+
+
+## ----Model Assumptions, warning=FALSE, message=FALSE--------------------------------------
+## A check of model assumptions
+par(mfrow=c(2,2))
+plot(lm.mod)
+
+
+## ----LASSO Model--------------------------------------------------------------------------
+## Setting up matrices for LASSO (using onehot df)
+train_x <- as.matrix(subset(tr.dfoh, select = -ELCLBTU))
+train_y <- as.matrix(subset(tr.dfoh, select = ELCLBTU))
+
+test_x <- as.matrix(subset(te.dfoh, select = -ELCLBTU))
+test_y <- as.matrix(subset(te.dfoh, select = ELCLBTU))
+
+## Pick the best LASSO regression model using built-in K-fold CV
+set.seed(1)
+#cv_lasso <- cv.glmnet(train_x, train_y, alpha=1)
+cv_lasso <- cv.glmnet(train_x, log(train_y), alpha=1)     ## log(ELCLBTU) version
+
+## Plot of MSE vs. lambda
+plot(cv_lasso)
+
+## Lambda with minimum MSE
+cv_lasso$lambda.min
+
+lasso_coefs <- coef(cv_lasso, s = "lambda.min")
+length(lasso_coefs[lasso_coefs != 0])
+
+#lasso.mod <- glmnet(train_x, train_y, alpha=1, lambda=cv_lasso$lambda.min)        ## non-log version
+lasso.mod <- glmnet(train_x, log(train_y), alpha=1, lambda=cv_lasso$lambda.min)    ## log(SP) version
+
+err.lasso <- c(rmse(lasso.mod, train_x, train_y), rmse(lasso.mod, test_x, test_y))
+err.lasso
+
+
+## ----step.Gam Optimization----------------------------------------------------------------
+start.mod <- gam(log(ELCLBTU) ~ SQFT, data = tr.df)
+
+list.scope <- list(
+   "SQFT" = ~1 + SQFT + s(SQFT, df=2) + s(SQFT, df=3)  + s(SQFT, df=5),
+   "NFLOOR" = ~1 + NFLOOR + s(NFLOOR, df=2) + s(NFLOOR, df=3)  + s(NFLOOR, df=5),
+   "FLCEILHT" = ~1 + FLCEILHT + s(FLCEILHT, df=2) + s(FLCEILHT, df=3)  + s(FLCEILHT, df=5),
+   "YRCONC" = ~1 + YRCONC + s(YRCONC, df=2) + s(YRCONC, df=3)  + s(YRCONC, df=5),
+   "NOCCAT" = ~1 + NOCCAT + s(NOCCAT, df=2) + s(NOCCAT, df=3)  + s(NOCCAT, df=5),
+   "MONUSE" = ~1 + MONUSE + s(MONUSE, df=2) + s(MONUSE, df=3)  + s(MONUSE, df=5),
+   "WKHRS" = ~1 + WKHRS + s(WKHRS, df=2) + s(WKHRS, df=3)  + s(WKHRS, df=5),
+   "NWKER" = ~1 + NWKER + s(NWKER, df=2) + s(NWKER, df=3)  + s(NWKER, df=5),
+   "COOLP" = ~1 + COOLP + s(COOLP, df=2) + s(COOLP, df=3)  + s(COOLP, df=5),
+   "HDD65" = ~1 + HDD65 + s(HDD65, df=2) + s(HDD65, df=3)  + s(HDD65, df=5),
+   "CDD65" = ~1 + CDD65 + s(CDD65, df=2) + s(CDD65, df=3)  + s(CDD65, df=5)
+)
+
+
+step.Gam(start.mod, list.scope, direction="both", trace=1)
+
+
+## ----Best Gam Model-----------------------------------------------------------------------
+## Best GAM model from optimization
+best.gam <- gam(formula = log(ELCLBTU) ~ s(SQFT, df = 5) + FLCEILHT + YRCONC + 
+    MONUSE + s(WKHRS, df = 2) + s(COOLP, df = 5) + HDD65 + s(CDD65, 
+    df = 5), data = tr.df, trace = FALSE)
+
+err.gam <- c(rmse(best.gam, tr.df, tr.df$ELCLBTU), rmse(best.gam, te.df, te.df$ELCLBTU))
+err.gam
+
+plot(best.gam)
+
+
+## ----SVR Optimization---------------------------------------------------------------------
+## Tuning of SVR model
+
+tune.out = tune(svm, log(ELCLBTU) ~., data=tr.df, kernel="polynomial", ranges=list(epsilon=seq(0,.3,0.1), cost=seq(1,75,5)))
+plot(tune.out)
+print(tune.out)
+
+#summary(tune.out)
+
+
+
+## -----------------------------------------------------------------------------------------
+svr.mod <- tune.out$best.model
+#svr.mod <- svm(log(ELCLBTU) ~., tr.df, kernel="polynomial", cost=10, scale=TRUE)
+
+summary(svr.mod)
+
+err.svr <- c(rmse(svr.mod, tr.df, tr.df$ELCLBTU), rmse(svr.mod, te.df, te.df$ELCLBTU))
+err.svr
+
+
+## ----Rpart Model--------------------------------------------------------------------------
+set.seed(1)
+#rpart.mod <- rpart(ELCLBTU ~., data=tr.df)
+rpart.mod <- rpart(log(ELCLBTU) ~., data=tr.df)    ##log(ELCLBTU) versions
+printcp(rpart.mod)
+minCP <- rpart.mod$cptable[which.min(rpart.mod$cptable[,"xerror"]),"CP"]    ##finds the minCP
+
+## Prune tree to cp with minimum error
+#par(mfrow=c(1,2))
+plotcp(rpart.mod)
+rpart.mod <- prune(rpart.mod, cp=minCP) 
+
+## Plot tree diagram
+rpart.plot(rpart.mod, main="Rpart Tree")
+
+err.rpart <- c(rmse(rpart.mod, tr.df, tr.df$ELCLBTU), rmse(rpart.mod, te.df, te.df$ELCLBTU))
+err.rpart
+
+
+## ----Random Forest Optimization Function, eval=T------------------------------------------
+
+## rf.cv() takes dataframe (data), hyperparameter to be tuned (hp) and values for hp (DOE)
+
+rf.cv <- function(data, hp, DOE) { 
+  nfolds <- 5              ## number of folds
+  
+  set.seed(1)
+  data$fold <- sample(1:nfolds, nrow(data), replace = TRUE)        ## adds a column that assigns each row to a fold
+  val.rmse <- vector()              ## initializes vector for to capture rmse of each fold
+  rmse.vec <- vector()              ## initialize vector for capturing the mean(rmse) of each hyperparameter
+  
+  #DOE <- seq(10,ncol(data)-1-20,10)
+  
+  ## Outer loop cycles through hyperparameter values in DOE
+  for (i in DOE) { 
+    
+    ## Inner loop cycles through the K-fold CV
+    for (j in 1:nfolds) {
+      train_df <- data[data$fold != j, -ncol(data)]   ## sets CV train df
+      val_df <- data[data$fold == j, -ncol(data)]
+      
+      ## If statement selects hyperparameter to be tuned
+      if (hp == "mtry") {
+        #rf.mod <- randomForest(ELCLBTU ~., mtry=i, data=train_df)
+        rf.mod <- randomForest(log(ELCLBTU) ~., mtry=i, data=train_df)  
+      } else if (hp == "ntree") {
+        rf.mod <- randomForest(log(ELCLBTU) ~., ntree=i, data=train_df)
+      } else {
+        stop('wrong hyperparameter')
+      }
+      
+      val.rmse[j] <- rmse(rf.mod, val_df, val_df$ELCLBTU)   ## captures rmse for each "fold"
+      
+    }
+    #print(val.rmse)
+    rmse.vec[which(DOE == i)] <- (mean(val.rmse))     ## captures mean of all k-folds for each value in DOE
+  }
+  return(rmse.vec)    ## returns vector of rmse for each value in DOE
+}
+
+
+
+## ----RF Function Calls--------------------------------------------------------------------
+## Calls functions and prints elasped time
+start.time <- Sys.time()
+
+DOE.rf1 <- c(seq(10,ncol(tr.df)-1,10), 54)
+rf.rmse1 <- rf.cv(tr.df, "mtry", DOE.rf1)       ##this funtion returns a vector of mean(rmse) for each hyperparameter run
+DOE.rf2 <- c(10, 100, 500, 1000, 2000)
+rf.rmse2 <- rf.cv(tr.df, "ntree", DOE.rf2) 
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+
+## ----Plot of RF CV Results----------------------------------------------------------------
+par(mfrow=c(1,2))
+plot(rf.rmse1 ~ DOE.rf1, main="RMSE w/ Random Forest Model", xlab="# of parameters at each split", ylab="RMSE")
+plot(rf.rmse2 ~ DOE.rf2, main="RMSE w/ Random Forest Model", xlab="# of trees", ylab="RMSE")
+
+
+## ----Best Random Forest Model-------------------------------------------------------------
+## Plots to tune hyperparameters
+rf.mod <- randomForest(log(ELCLBTU) ~., mtry=50, ntree=500, data=tr.df)
+err.rf <- c(rmse(rf.mod, tr.df, tr.df$ELCLBTU),rmse(rf.mod, te.df, te.df$ELCLBTU))
+
+
+## ----Random Forest Variable Importance Plot, fig.height=6---------------------------------
+var_imp <- varImpPlot(rf.mod, main="Variable Importance Plot")
+
+
+## ----Boosting Optimization Function, eval=T-----------------------------------------------
+
+## boost.cv() takes dataframe (data), hyperparameter to be tuned (hp) and values for hp (DOE)
+
+boost.cv <- function(data, hp, DOE) { 
+  nfolds <- 5
+  
+  set.seed(1)
+  data$fold <- sample(1:nfolds, nrow(data), replace = TRUE)        ## adds a column that assigns each row to a fold
+  val.rmse <- vector()              ## initializes vector for results
+  rmse.vec <- vector()  ## initialize vector for below chart
+  
+  ntree <- 1000         ## sets number of trees for model
+  
+  for (i in DOE) { 
+    
+    for (j in 1:nfolds) {
+      train_df <- data[data$fold != j, -ncol(data)]
+      val_df <- data[data$fold == j, -ncol(data)]
+      
+      if (hp == "interaction.depth") {
+        boost.mod <- gbm(log(ELCLBTU) ~., data=train_df, distribution="gaussian",n.trees=ntree, interaction.depth=i)
+      } else if (hp == "shrinkage") {
+        boost.mod <- gbm(log(ELCLBTU) ~., data=train_df, distribution="gaussian",n.trees=ntree, interaction.depth=3, shrinkage=i)
+      } else if (hp == "n.trees") {
+        boost.mod <- gbm(log(ELCLBTU) ~., data=train_df, distribution="gaussian",n.trees=i, interaction.depth=3, shrinkage=.1)
+      } else {
+        stop('wrong hyperparameter')
+      }
+      
+      val.rmse[j] <- rmse.boost(boost.mod, val_df, val_df$ELCLBTU, ntree)
+      
+    }
+    #print(val.rmse)
+    #print(paste(mean(val.rmse), sd(val.rmse)))
+    rmse.vec[which(DOE == i)] <- mean(val.rmse)          ## because index has switched to non-integer sequence
+  }
+  return(rmse.vec)
+}
+
+
+## ----Boost Function Call------------------------------------------------------------------
+## Calls functions and prints elasped time
+start.time <- Sys.time()
+
+DOE.boost1 <- c(1,3,4,5,6)
+boost1.rmse <- boost.cv(tr.df, "interaction.depth", DOE.boost1)
+DOE.boost2 <- c(.2, .1, 0.01, 0.005)
+boost2.rmse <- boost.cv(tr.df, "shrinkage", DOE.boost2)
+DOE.boost3 <- c(500, 1000, 3000, 5000)
+boost3.rmse <- boost.cv(tr.df, "n.trees", DOE.boost3)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+
+## ----Boosting CV Optimization Plots-------------------------------------------------------
+## Plots to tune hyperparameters
+par(mfrow=c(1,3))
+plot(boost1.rmse ~ DOE.boost1, main="Interaction Depth", xlab="Interaction Depth", ylab="RMSE")
+plot(boost2.rmse ~ DOE.boost2, main="Shrinkage Factor", xlab="Shrinkage Factor", ylab="RMSE")
+plot(boost3.rmse ~ DOE.boost3, main="Number of Trees", xlab="Number of Trees", ylab="RMSE")
+
+
+## ----Best Boosting Model------------------------------------------------------------------
+## Run gbm and get rmse with best hyperparameters
+set.seed(1)
+ntree <- 1000
+boost.mod <- gbm(log(ELCLBTU) ~., data=tr.df, distribution="gaussian",n.trees=ntree, interaction.depth=3, shrinkage=0.01)
+
+err.boost <- c(rmse.boost(boost.mod, tr.df, tr.df$ELCLBTU, ntree), rmse.boost(boost.mod, te.df, te.df$ELCLBTU, ntree))
+err.boost
+
+
+
+## ----Earth Models-------------------------------------------------------------------------
+## Earth model w/ pruning
+#earth.mod <- earth(ELCLBTU ~., data=tr.df)
+earth.mod <- earth(log(ELCLBTU) ~., data=tr.df) 
+
+## Earth model w/o pruning
+#earth.mod <- earth(log(ELCLBTU) ~., data=tr.df, pmethod="none")
+
+err.earth <- c(rmse(earth.mod, tr.df, tr.df$ELCLBTU),rmse(earth.mod, te.df, te.df$ELCLBTU))
+
+summary(earth.mod, digits = 2)
+## Plots of the predictors 
+plotmo(earth.mod, ngrid1=51)
+## Variable importance
+evimp(earth.mod, trim=FALSE)
+
+
+## ----BART Optimization Function, eval=T, message=F, warning=F-----------------------------
+
+## bart.cv() takes dataframe (data), hyperparameter to be tuned (hp) and valuse for hp (DOE)
+
+bart.cv <- function(data, hp, DOE) { 
+  nfolds <- 5              ## number of folds
+  
+  set.seed(1)
+  data$fold <- sample(1:nfolds, nrow(data), replace = TRUE)        ## adds a column that assigns each row to a fold
+  val.rmse <- vector()              ## initializes vector for to capture rmse of each fold
+  rmse.vec <- vector()  ## initialize vector for capturing the mean(rmse) of each hyperparameter
+  q <- c(.9, .99, .75)
+  nu <- c(3, 3, 10)
+
+  for (i in DOE) { 
+    
+    for (j in 1:nfolds) {
+      train_df <- data[data$fold != j, -ncol(data)]   ## sets CV train df
+      val_df <- data[data$fold == j, -ncol(data)]
+      tr.df.Bart <- subset(train_df, select = -c(ELCLBTU))
+      val.df.Bart <- subset(val_df, select = -c(ELCLBTU))
+      
+      if (hp == "num_trees") { 
+        bart.mod <- bartMachine(X=tr.df.Bart, y=log(train_df$ELCLBTU), seed = 1, num_trees=i)
+        } else if (hp == "k") {
+        bart.mod <- bartMachine(X=tr.df.Bart, y=log(train_df$ELCLBTU), seed = 1, k = i)
+        } else if (hp == "sigma") {
+        bart.mod <- bartMachine(X=tr.df.Bart, y=log(train_df$ELCLBTU), seed = 1, q = q[i], nu = nu[i])
+        } else {
+        stop('wrong hyperparameter')
+        }
+      
+      val.rmse[j] <- rmse(bart.mod, val.df.Bart, val_df$ELCLBTU)
+      
+    }
+    #print(val.rmse)
+    rmse.vec[which(DOE == i)] <- (mean(val.rmse))
+  }
+  return(rmse.vec)
+}
+
+
+
+
+## ----BART Function Calls------------------------------------------------------------------
+## Calls functions and prints elasped time
+start.time <- Sys.time()
+
+DOE.bart1 <- c(50, 100, 1000)
+bart1.rmse <- bart.cv(tr.df, "num_trees", DOE.bart1)    ##this funtion returns a vector of mean(rmse) for each hyperparameter run
+DOE.bart2 <- c(1, 2, 3, 4, 5)
+bart2.rmse <- bart.cv(tr.df, "k", DOE.bart2)    ##this funtion returns a vector of mean(rmse) for each hyperparameter run
+DOE.bart3 <- c(1,2,3)     ### this corresponds to 'default', 'aggressive', 'conservative' WRT the sigma prior
+bart3.rmse <- bart.cv(tr.df, "sigma", DOE.bart3)    ##this funtion returns a vector of mean(rmse) for each hyperparameter run
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+
+## ----BART CV Results----------------------------------------------------------------------
+par(mfrow=c(1,3))
+plot(bart1.rmse ~ DOE.bart1, main="RMSE w/ BART Model", xlab="Number of Trees", ylab="RMSE")
+plot(bart2.rmse ~ DOE.bart2, main="RMSE w/ BART Model", xlab="k", ylab="RMSE")
+plot(bart3.rmse ~ DOE.bart3, main="RMSE w/ BART Model", xaxt="n", xlab="Sigma Prior", ylab="RMSE")
+axis(1, at = DOE.bart3, labels = c("Default", "Aggressive", "Conservative"), las = 1, cex.axis=0.7)
+
+
+## ----RMSE for Best BART mod---------------------------------------------------------------
+## BART setup
+tr.df.Bart <- subset(tr.df, select = -c(ELCLBTU))
+te.df.Bart <- subset(te.df, select = -c(ELCLBTU))
+
+## Using hyperparameters from CV
+best.bart <- bartMachine(X=tr.df.Bart, y=log(tr.df$ELCLBTU), num_trees=50, k=2, q = .75, nu = 10, seed = 1)
+
+## Using defaults (i.e. to skip CV)
+#best.bart <- bartMachine(X=tr.df.Bart, y=log(tr.df$ELCLBTU), seed = 1)
+
+err.bart <- c(rmse(best.bart, tr.df.Bart, tr.df$ELCLBTU),rmse(best.bart, te.df.Bart, te.df$ELCLBTU)); err.bart
+
+## "var_selection_by_permute" was only working in console vice Markdown
+#investigate_var_importance(bart.mod, num_replicates_for_avg=2)
+
+
+
+## ----Summary Table, include=TRUE----------------------------------------------------------
+## Makes df of error results
+err.df <- as.data.frame(rbind(err.lm, err.lasso, err.gam, err.svr, err.rpart, err.rf, err.boost, err.earth, err.bart))
+colnames(err.df) <- c("Training RMSE", "Test RMSE")
+err.df[order(err.df$`Test RMSE`),]
+
+
+## ----Final Datasave, echo=F---------------------------------------------------------------
+## Outputs to data files
+finalmodel <- earth.mod
+
+saveRDS(err.df[order(err.df$`Test RMSE`),], file= 'data/RMSE_table_2.rds')
+save(finalmodel, file= 'data/bballer.RData')
+save.image('data/final_data.RData')
+
+
+## ----What Happens if We Remove One Predictor from MARS, eval=F----------------------------
+## resp_col <- which(colnames(df) == "ELCLBTU")
+## rmse.vec <- vector()
+## for (i in 1:55) {
+##   if(i != resp_col) {
+##     df1 <- df[,-i]
+##     mod <- earth(log(ELCLBTU) ~., data=df1)
+##     rmse.vec[i] <- rmse(mod, df1, df1$ELCLBTU)
+##   }
+## }
+
